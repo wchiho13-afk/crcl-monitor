@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-CRCL 完整免費版監控警報系統
+CRCL 完整免費版監控警報系統 v2.0
 監控範圍：技術指標、大額成交量、SEC Form 4 高管交易、機構持倉變化、新聞過濾、每日總結
+新增：ARK 每日持倉監控、期權市場情緒、Clarity Act 法案進度追蹤、USDC 流通量監控
 """
 
 import os
@@ -40,6 +41,34 @@ FOMO_DOWN_PCT = -8.0
 
 # 大額成交量倍數（超過 5 日平均的 X 倍才算大額）
 VOLUME_SPIKE_MULTIPLIER = 3.0
+
+# ARK ETF 代號（持有 CRCL 的主要 ARK 基金）
+ARK_FUNDS = ["ARKK", "ARKW", "ARKF"]
+
+# 狀態記錄文件（避免重複發送相同警報）
+STATE_FILE = "/home/ubuntu/crcl_monitor/state.json"
+
+# ============================================================
+# 狀態管理
+# ============================================================
+
+def load_state():
+    """載入狀態記錄"""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_state(state):
+    """保存狀態記錄"""
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"[狀態] 保存失敗: {e}")
 
 # ============================================================
 # 工具函數
@@ -246,7 +275,6 @@ def check_sec_form4():
     """監控 SEC Form 4 高管內部交易"""
     print("[SEC Form 4] 正在查詢高管交易...")
     try:
-        # 使用 SEC EDGAR RSS Feed 獲取最新 Form 4 申報
         url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={COMPANY_CIK}&type=4&dateb=&owner=include&count=5&search_text="
         headers = {"User-Agent": "CRCL Monitor Bot contact@example.com"}
         r = requests.get(url, headers=headers, timeout=15)
@@ -255,7 +283,6 @@ def check_sec_form4():
             print(f"[SEC Form 4] 查詢失敗: {r.status_code}")
             return
 
-        # 解析 HTML 找到最新申報
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(r.text, 'html.parser')
 
@@ -265,8 +292,8 @@ def check_sec_form4():
             print("[SEC Form 4] 未找到申報記錄")
             return
 
-        rows = table.find_all('tr')[1:]  # 跳過標題行
-        for row in rows[:3]:  # 只看最新 3 筆
+        rows = table.find_all('tr')[1:]
+        for row in rows[:3]:
             cols = row.find_all('td')
             if len(cols) >= 4:
                 filing_type = cols[0].text.strip()
@@ -279,11 +306,9 @@ def check_sec_form4():
                         'url': "https://www.sec.gov" + link['href']
                     })
 
-        # 檢查今天是否有新的 Form 4
         today = datetime.now().strftime('%Y-%m-%d')
         for filing in filings:
             if filing['date'] == today and '4' in filing['type']:
-                # 獲取申報詳情
                 detail = parse_form4_detail(filing['url'], headers)
                 if detail:
                     send_form4_alert(detail)
@@ -298,7 +323,6 @@ def parse_form4_detail(url, headers):
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(r.text, 'html.parser')
 
-        # 找到 XML 文件連結
         xml_link = None
         for link in soup.find_all('a'):
             if link.text and '.xml' in link.get('href', ''):
@@ -308,20 +332,15 @@ def parse_form4_detail(url, headers):
         if not xml_link:
             return None
 
-        # 解析 XML
         r2 = requests.get(xml_link, headers=headers, timeout=15)
         root = ET.fromstring(r2.content)
 
-        ns = {'': 'http://www.sec.gov/cgi-bin/viewer?action=view&cik='}
-
-        # 提取申報人信息
         reporter_name = ""
         reporter_title = ""
         transaction_type = ""
         shares = 0
         price = 0.0
 
-        # 嘗試提取關鍵信息
         for elem in root.iter():
             tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
             if tag == 'rptOwnerName' and elem.text:
@@ -343,25 +362,10 @@ def parse_form4_detail(url, headers):
 
         total_value = shares * price
 
-        # 只關注自有資金買入（P 類型）且金額超過 $10 萬
         if transaction_type == 'P' and total_value >= 100000:
-            return {
-                'name': reporter_name,
-                'title': reporter_title,
-                'type': 'buy',
-                'shares': shares,
-                'price': price,
-                'total': total_value
-            }
+            return {'name': reporter_name, 'title': reporter_title, 'type': 'buy', 'shares': shares, 'price': price, 'total': total_value}
         elif transaction_type == 'S' and total_value >= 100000:
-            return {
-                'name': reporter_name,
-                'title': reporter_title,
-                'type': 'sell',
-                'shares': shares,
-                'price': price,
-                'total': total_value
-            }
+            return {'name': reporter_name, 'title': reporter_title, 'type': 'sell', 'shares': shares, 'price': price, 'total': total_value}
 
         return None
 
@@ -414,7 +418,6 @@ def check_news():
             print("[新聞] 無最新新聞")
             return
 
-        # 重要關鍵字（利多）
         positive_keywords = [
             'clarity act', 'usdc', 'partnership', 'visa', 'mastercard',
             'blackrock', 'earnings beat', 'revenue', 'arc blockchain',
@@ -422,14 +425,12 @@ def check_news():
             'circle mint', 'institutional'
         ]
 
-        # 重要關鍵字（利空）
         negative_keywords = [
             'lawsuit', 'sec investigation', 'depeg', 'ban', 'rejected',
             'failed', 'scandal', 'fraud', 'hack', 'breach',
             'lost partnership', 'competitor', 'regulation blocked'
         ]
 
-        # 過濾掉的無用關鍵字
         noise_keywords = [
             'bitcoin price', 'ethereum price', 'crypto market',
             'dow jones', 's&p 500', 'nasdaq', 'fed rate',
@@ -439,25 +440,21 @@ def check_news():
         important_news = []
         checked_titles = set()
 
-        for article in news[:10]:  # 只看最新 10 條
+        for article in news[:10]:
             title = article.get('title', '').lower()
             pub_time = article.get('providerPublishTime', 0)
 
-            # 跳過重複標題
             if title in checked_titles:
                 continue
             checked_titles.add(title)
 
-            # 跳過超過 24 小時的舊新聞
             if pub_time and (time.time() - pub_time) > 86400:
                 continue
 
-            # 過濾無用雜訊
             is_noise = any(kw in title for kw in noise_keywords)
             if is_noise:
                 continue
 
-            # 判斷是否重要
             is_positive = any(kw in title for kw in positive_keywords)
             is_negative = any(kw in title for kw in negative_keywords)
 
@@ -471,7 +468,7 @@ def check_news():
                 })
 
         if important_news:
-            for news_item in important_news[:2]:  # 最多發 2 條
+            for news_item in important_news[:2]:
                 if news_item['is_positive']:
                     meaning = "這條新聞對 Circle 的業務是正面的，支持你的長期持有邏輯。不需要行動，繼續持有。"
                 else:
@@ -492,11 +489,492 @@ def check_news():
         print(f"[新聞] 錯誤: {e}")
 
 # ============================================================
-# 模組五：每日總結
+# 模組六（新）：ARK Invest 每日持倉監控
+# 數據來源：ARK 官方每日公開 CSV（完全免費）
+# ============================================================
+
+def check_ark_holdings():
+    """監控 ARK Invest 對 CRCL 的每日持倉變化"""
+    print("[ARK] 正在查詢 ARK 持倉...")
+    state = load_state()
+    last_ark_shares = state.get('ark_total_shares', 0)
+
+    total_shares = 0
+    fund_details = []
+
+    for fund in ARK_FUNDS:
+        try:
+            # ARK 每天公開當日持倉 CSV
+            url = f"https://ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_INNOVATION_ETF_{fund}_HOLDINGS.csv"
+            # 嘗試通用格式
+            urls_to_try = [
+                f"https://ark-funds.com/wp-content/uploads/funds-etf-csv/ARK_INNOVATION_ETF_{fund}_HOLDINGS.csv",
+                f"https://ark-funds.com/wp-content/uploads/funds-etf-csv/{fund}_holdings.csv",
+            ]
+
+            df = None
+            for u in urls_to_try:
+                try:
+                    resp = requests.get(u, timeout=10)
+                    if resp.status_code == 200 and len(resp.text) > 100:
+                        from io import StringIO
+                        df = pd.read_csv(StringIO(resp.text))
+                        break
+                except:
+                    continue
+
+            if df is None:
+                # 備用：用 yfinance 查 ARK ETF 持倉
+                continue
+
+            # 搜尋 CRCL
+            df.columns = [c.lower().strip() for c in df.columns]
+            ticker_col = next((c for c in df.columns if 'ticker' in c or 'symbol' in c), None)
+            shares_col = next((c for c in df.columns if 'shares' in c), None)
+            weight_col = next((c for c in df.columns if 'weight' in c), None)
+            value_col = next((c for c in df.columns if 'value' in c or 'market' in c), None)
+
+            if ticker_col and shares_col:
+                crcl_row = df[df[ticker_col].astype(str).str.upper() == 'CRCL']
+                if not crcl_row.empty:
+                    shares = float(str(crcl_row[shares_col].iloc[0]).replace(',', ''))
+                    weight = float(str(crcl_row[weight_col].iloc[0]).replace('%', '').replace(',', '')) if weight_col else 0
+                    total_shares += shares
+                    fund_details.append({'fund': fund, 'shares': shares, 'weight': weight})
+
+        except Exception as e:
+            print(f"[ARK] {fund} 查詢失敗: {e}")
+            continue
+
+    # 如果 CSV 方式失敗，使用備用 API
+    if total_shares == 0:
+        total_shares, fund_details = get_ark_holdings_fallback()
+
+    if total_shares == 0:
+        print("[ARK] 無法獲取 ARK 持倉數據")
+        return
+
+    print(f"[ARK] 當前總持倉: {total_shares:,.0f} 股")
+
+    # 比較與昨日的變化
+    if last_ark_shares > 0:
+        change = total_shares - last_ark_shares
+        change_pct = (change / last_ark_shares) * 100
+
+        if abs(change) >= 10000:  # 變化超過 1 萬股才發通知
+            action = "買入加倉" if change > 0 else "賣出減倉"
+            emoji = "🏦" if change > 0 else "🏦"
+
+            # 估算金額（用當前股價）
+            try:
+                ticker = yf.Ticker(TICKER)
+                current_price = ticker.history(period="1d")['Close'].iloc[-1]
+                change_value = abs(change) * current_price
+            except:
+                current_price = 0
+                change_value = 0
+
+            if change > 0:
+                meaning = (
+                    f"全球最著名的科技股基金（管理 $50 億美金）今天在市場上買入了更多 CRCL。\n"
+                    f"這說明 ARK 認為現在的價格仍然值得買入。\n\n"
+                    f"*你現在的感受應該是：*\n你的判斷方向跟機構一致，繼續持有。"
+                )
+            else:
+                meaning = (
+                    f"ARK 今天減少了 CRCL 持倉。這可能是基金贖回壓力或調倉，不一定代表看空。\n"
+                    f"需要留意後續幾天是否持續減倉。\n\n"
+                    f"*你需要做的事：*\n觀察後續走勢，如果連續 3 天減倉才需要重新評估。"
+                )
+
+            fund_str = ""
+            for fd in fund_details:
+                fund_str += f"  {fd['fund']}：{fd['shares']:,.0f} 股（佔比 {fd['weight']:.2f}%）\n"
+
+            msg = (
+                f"{emoji} *ARK Invest CRCL 持倉變化*\n\n"
+                f"動作：*{action}*\n"
+                f"變化股數：{abs(change):,.0f} 股（{change_pct:+.1f}%）\n"
+                f"估計金額：約 ${change_value:,.0f} 美金\n"
+                f"ARK 總持倉：{total_shares:,.0f} 股\n\n"
+                f"各基金明細：\n{fund_str}\n"
+                f"*這個信號的意思：*\n{meaning}"
+            )
+            send_telegram(msg)
+
+    # 更新狀態
+    state['ark_total_shares'] = total_shares
+    state['ark_last_update'] = datetime.now().strftime('%Y-%m-%d')
+    save_state(state)
+
+def get_ark_holdings_fallback():
+    """備用方案：從 Stockanalysis 抓取 ARK 持倉"""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        url = "https://stockanalysis.com/etf/arkk/holdings/"
+        r = requests.get(url, headers=headers, timeout=15)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(r.text, 'html.parser')
+
+        # 找 CRCL 行
+        tables = soup.find_all('table')
+        for table in tables:
+            rows = table.find_all('tr')
+            for row in rows:
+                cells = row.find_all('td')
+                if cells and any('CRCL' in c.text for c in cells):
+                    # 找股數列
+                    for i, cell in enumerate(cells):
+                        if 'CRCL' in cell.text:
+                            # 通常股數在後面幾列
+                            for j in range(i+1, min(i+5, len(cells))):
+                                try:
+                                    val = float(cells[j].text.replace(',', '').replace('M', '000000').replace('K', '000').strip())
+                                    if val > 1000:
+                                        return val, [{'fund': 'ARKK', 'shares': val, 'weight': 0}]
+                                except:
+                                    continue
+    except Exception as e:
+        print(f"[ARK 備用] 錯誤: {e}")
+
+    return 0, []
+
+# ============================================================
+# 模組七（新）：期權市場情緒分析
+# 數據來源：Yahoo Finance 期權鏈（完全免費）
+# ============================================================
+
+def check_options_sentiment():
+    """分析 CRCL 期權市場情緒（大戶看漲還是看跌）"""
+    print("[期權] 正在分析期權市場情緒...")
+    try:
+        ticker = yf.Ticker(TICKER)
+
+        # 獲取期權到期日列表
+        expirations = ticker.options
+        if not expirations:
+            print("[期權] 無期權數據")
+            return
+
+        # 取最近 2 個到期日的數據
+        total_call_oi = 0
+        total_put_oi = 0
+        total_call_volume = 0
+        total_put_volume = 0
+        large_calls = []  # 大額 Call 期權
+        large_puts = []   # 大額 Put 期權
+
+        for exp in expirations[:2]:
+            try:
+                chain = ticker.option_chain(exp)
+                calls = chain.calls
+                puts = chain.puts
+
+                # 統計未平倉量和成交量
+                total_call_oi += calls['openInterest'].sum()
+                total_put_oi += puts['openInterest'].sum()
+                total_call_volume += calls['volume'].fillna(0).sum()
+                total_put_volume += puts['volume'].fillna(0).sum()
+
+                # 找大額期權（未平倉量 > 500）
+                big_calls = calls[calls['openInterest'] > 500].nlargest(3, 'openInterest')
+                big_puts = puts[puts['openInterest'] > 500].nlargest(3, 'openInterest')
+
+                for _, row in big_calls.iterrows():
+                    large_calls.append({
+                        'exp': exp,
+                        'strike': row['strike'],
+                        'oi': row['openInterest'],
+                        'volume': row.get('volume', 0)
+                    })
+
+                for _, row in big_puts.iterrows():
+                    large_puts.append({
+                        'exp': exp,
+                        'strike': row['strike'],
+                        'oi': row['openInterest'],
+                        'volume': row.get('volume', 0)
+                    })
+
+            except Exception as e:
+                print(f"[期權] {exp} 解析失敗: {e}")
+                continue
+
+        if total_call_oi + total_put_oi == 0:
+            print("[期權] 無有效期權數據")
+            return
+
+        # 計算 Put/Call 比率
+        pc_ratio_oi = total_put_oi / total_call_oi if total_call_oi > 0 else 1
+        pc_ratio_vol = total_put_volume / total_call_volume if total_call_volume > 0 else 1
+
+        print(f"[期權] Call OI: {total_call_oi:,.0f} | Put OI: {total_put_oi:,.0f} | P/C 比率: {pc_ratio_oi:.2f}")
+
+        # 判斷市場情緒
+        if pc_ratio_oi < 0.7:
+            sentiment = "強烈看漲 🟢🟢"
+            sentiment_meaning = (
+                f"大戶買入 Call（看漲期權）的數量遠超 Put（看跌期權）。\n"
+                f"這說明機構投資者預期 CRCL 股價會上漲。\n\n"
+                f"*你現在的感受應該是：*\n市場的聰明錢跟你站在同一邊。"
+            )
+        elif pc_ratio_oi < 0.9:
+            sentiment = "偏向看漲 🟢"
+            sentiment_meaning = (
+                f"Call 期權比 Put 期權多，市場整體偏向看漲。\n"
+                f"這是一個正面信號，但不是極端情緒。"
+            )
+        elif pc_ratio_oi < 1.1:
+            sentiment = "中性 ⚪"
+            sentiment_meaning = (
+                f"Call 和 Put 數量相近，市場方向不明確。\n"
+                f"這種情況下，等待其他信號再做決定。"
+            )
+        elif pc_ratio_oi < 1.3:
+            sentiment = "偏向看跌 🔴"
+            sentiment_meaning = (
+                f"Put 期權比 Call 期權多，市場有一定的看跌情緒。\n"
+                f"這不代表一定會跌，但需要留意。"
+            )
+        else:
+            sentiment = "強烈看跌 🔴🔴"
+            sentiment_meaning = (
+                f"大戶買入大量 Put（看跌期權），說明機構在對沖風險或預期下跌。\n"
+                f"這是一個警示信號，需要謹慎。\n\n"
+                f"*你需要做的事：*\n暫緩買入，等待情緒轉變。"
+            )
+
+        # 找最大的 Call 目標價（大戶預期漲到哪裡）
+        top_call_strikes = ""
+        if large_calls:
+            sorted_calls = sorted(large_calls, key=lambda x: x['oi'], reverse=True)[:3]
+            for c in sorted_calls:
+                top_call_strikes += f"  Call ${c['strike']:.0f}（到期：{c['exp']}，未平倉：{c['oi']:,.0f}）\n"
+
+        top_put_strikes = ""
+        if large_puts:
+            sorted_puts = sorted(large_puts, key=lambda x: x['oi'], reverse=True)[:3]
+            for p in sorted_puts:
+                top_put_strikes += f"  Put ${p['strike']:.0f}（到期：{p['exp']}，未平倉：{p['oi']:,.0f}）\n"
+
+        msg = (
+            f"📊 *CRCL 期權市場情緒分析*\n\n"
+            f"整體情緒：*{sentiment}*\n"
+            f"Put/Call 比率：{pc_ratio_oi:.2f}（低於 0.7 = 看漲，高於 1.3 = 看跌）\n\n"
+            f"Call 未平倉量：{total_call_oi:,.0f}\n"
+            f"Put 未平倉量：{total_put_oi:,.0f}\n\n"
+        )
+
+        if top_call_strikes:
+            msg += f"*大戶看漲目標價（最大 Call）：*\n{top_call_strikes}\n"
+        if top_put_strikes:
+            msg += f"*大戶對沖位置（最大 Put）：*\n{top_put_strikes}\n"
+
+        msg += f"*這個信號的意思：*\n{sentiment_meaning}"
+
+        send_telegram(msg)
+
+    except Exception as e:
+        print(f"[期權] 錯誤: {e}")
+
+# ============================================================
+# 模組八（新）：Clarity Act 法案進度追蹤
+# 數據來源：Congress.gov RSS Feed（完全免費）
+# ============================================================
+
+def check_clarity_act():
+    """追蹤 Clarity Act 法案最新進度"""
+    print("[法案] 正在查詢 Clarity Act 進度...")
+    state = load_state()
+    last_status = state.get('clarity_act_status', '')
+
+    try:
+        # 方法一：搜尋 Congress.gov RSS
+        keywords_to_check = [
+            'clarity act', 'stablecoin', 'genius act', 'digital asset',
+            'crypto regulation', 'usdc regulation'
+        ]
+
+        # 使用 Google News RSS（免費）
+        import urllib.parse
+        query = urllib.parse.quote('Clarity Act stablecoin Congress 2026')
+        rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(rss_url, headers=headers, timeout=15)
+
+        if r.status_code != 200:
+            print(f"[法案] RSS 查詢失敗: {r.status_code}")
+            return
+
+        root = ET.fromstring(r.content)
+        items = root.findall('.//item')
+
+        important_updates = []
+        positive_keywords = ['passed', 'approved', 'signed', 'vote', 'hearing', 'advance', 'progress', 'senate', 'house']
+        negative_keywords = ['failed', 'rejected', 'blocked', 'delayed', 'stalled', 'opposition']
+
+        for item in items[:10]:
+            title_elem = item.find('title')
+            pub_date_elem = item.find('pubDate')
+            link_elem = item.find('link')
+
+            if title_elem is None:
+                continue
+
+            title = title_elem.text or ''
+            title_lower = title.lower()
+            pub_date = pub_date_elem.text if pub_date_elem is not None else ''
+            link = link_elem.text if link_elem is not None else ''
+
+            # 只看包含法案關鍵字的新聞
+            if not any(kw in title_lower for kw in keywords_to_check):
+                continue
+
+            is_positive = any(kw in title_lower for kw in positive_keywords)
+            is_negative = any(kw in title_lower for kw in negative_keywords)
+
+            if is_positive or is_negative:
+                important_updates.append({
+                    'title': title,
+                    'date': pub_date,
+                    'link': link,
+                    'is_positive': is_positive
+                })
+
+        if important_updates:
+            latest = important_updates[0]
+            # 避免重複發送相同新聞
+            if latest['title'] != last_status:
+                if latest['is_positive']:
+                    emoji = "🏛️"
+                    meaning = (
+                        f"Clarity Act（穩定幣監管法案）有正面進展！\n"
+                        f"這是 CRCL 最重要的催化劑之一。法案通過後，USDC 將獲得法律保障，"
+                        f"機構採用率將大幅提升，直接利好 Circle 的業務。\n\n"
+                        f"*你現在的感受應該是：*\n這是你持有 CRCL 的核心理由正在實現。"
+                    )
+                else:
+                    emoji = "⚠️"
+                    meaning = (
+                        f"Clarity Act 遇到阻力。這是短期利空，但不代表法案最終會失敗。\n"
+                        f"美國的立法過程本來就是反覆的，一次挫折不代表結束。\n\n"
+                        f"*你需要做的事：*\n閱讀原文了解具體情況，不要因為一條新聞就做決定。"
+                    )
+
+                msg = (
+                    f"{emoji} *Clarity Act 法案最新動態*\n\n"
+                    f"標題：{latest['title']}\n"
+                    f"日期：{latest['date']}\n\n"
+                    f"*這個信號的意思：*\n{meaning}\n\n"
+                    f"原文：{latest['link']}"
+                )
+                send_telegram(msg)
+
+                state['clarity_act_status'] = latest['title']
+                save_state(state)
+        else:
+            print("[法案] 今日無 Clarity Act 重要動態")
+
+    except Exception as e:
+        print(f"[法案] 錯誤: {e}")
+
+# ============================================================
+# 模組九（新）：USDC 流通量監控
+# 數據來源：Circle 官方 API（完全免費）
+# ============================================================
+
+def check_usdc_supply():
+    """監控 USDC 流通量變化（Circle 核心業務指標）"""
+    print("[USDC] 正在查詢 USDC 流通量...")
+    state = load_state()
+    last_supply = state.get('usdc_supply', 0)
+
+    try:
+        # 方法一：CoinGecko API（免費，無需 API Key）
+        url = "https://api.coingecko.com/api/v3/coins/usd-coin"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=15)
+
+        if r.status_code != 200:
+            print(f"[USDC] CoinGecko 查詢失敗: {r.status_code}")
+            # 備用方案
+            check_usdc_supply_fallback(state, last_supply)
+            return
+
+        data = r.json()
+        market_data = data.get('market_data', {})
+        current_supply = market_data.get('circulating_supply', 0)
+        market_cap = market_data.get('market_cap', {}).get('usd', 0)
+
+        if current_supply == 0:
+            print("[USDC] 無法獲取流通量數據")
+            return
+
+        print(f"[USDC] 當前流通量: ${current_supply/1e9:.2f}B | 市值: ${market_cap/1e9:.2f}B")
+
+        # 比較變化
+        if last_supply > 0:
+            change = current_supply - last_supply
+            change_pct = (change / last_supply) * 100
+            change_b = change / 1e9  # 轉換為十億
+
+            # 只有變化超過 0.5% 才發通知
+            if abs(change_pct) >= 0.5:
+                if change > 0:
+                    emoji = "💵"
+                    action = "增加"
+                    meaning = (
+                        f"USDC 流通量增加，說明更多人在使用 USDC，Circle 的業務在增長。\n"
+                        f"Circle 的收入主要來自 USDC 儲備的利息，流通量越大，收入越高。\n\n"
+                        f"*你現在的感受應該是：*\n你持有 CRCL 的核心理由（業務增長）正在被數據驗證。"
+                    )
+                else:
+                    emoji = "📉"
+                    action = "減少"
+                    meaning = (
+                        f"USDC 流通量減少，可能是市場整體情緒偏空，或有競爭對手搶佔市場。\n"
+                        f"如果連續多日減少，需要重新評估持有邏輯。\n\n"
+                        f"*你需要做的事：*\n觀察後續趨勢，單日波動不需要過度反應。"
+                    )
+
+                msg = (
+                    f"{emoji} *USDC 流通量變化（Circle 核心業務指標）*\n\n"
+                    f"當前流通量：*${current_supply/1e9:.2f}B*（{current_supply/1e9:.2f} 十億美元）\n"
+                    f"變化：{action} {abs(change_b):.2f}B（{change_pct:+.2f}%）\n"
+                    f"市值：${market_cap/1e9:.2f}B\n\n"
+                    f"*這個信號的意思：*\n{meaning}"
+                )
+                send_telegram(msg)
+
+        # 更新狀態
+        state['usdc_supply'] = current_supply
+        state['usdc_last_update'] = datetime.now().strftime('%Y-%m-%d')
+        save_state(state)
+
+    except Exception as e:
+        print(f"[USDC] 錯誤: {e}")
+
+def check_usdc_supply_fallback(state, last_supply):
+    """備用方案：從 CryptoCompare 獲取 USDC 數據"""
+    try:
+        url = "https://min-api.cryptocompare.com/data/pricemultifull?fsyms=USDC&tsyms=USD"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        supply = data.get('RAW', {}).get('USDC', {}).get('USD', {}).get('SUPPLY', 0)
+        if supply > 0:
+            state['usdc_supply'] = supply
+            save_state(state)
+            print(f"[USDC 備用] 流通量: ${supply/1e9:.2f}B")
+    except Exception as e:
+        print(f"[USDC 備用] 錯誤: {e}")
+
+# ============================================================
+# 模組五：每日總結（升級版）
 # ============================================================
 
 def send_daily_summary():
-    """發送每日市場總結"""
+    """發送每日市場總結（包含所有新模組數據）"""
     print("[每日總結] 正在生成...")
     try:
         hist = get_price_data()
@@ -511,7 +989,6 @@ def send_daily_summary():
         avg_vol = hist['VolMA5'].iloc[-1]
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
 
-        # 判斷各項狀態
         rsi_status = "正常 ✅" if 35 <= current_rsi <= 65 else ("超賣（買入機會）🟢" if current_rsi < 35 else "超買（注意風險）⚠️")
         vol_status = "正常 ✅" if vol_ratio < 2 else f"異常放大 {vol_ratio:.1f}x ⚠️"
         price_status = "正常 ✅"
@@ -523,6 +1000,15 @@ def send_daily_summary():
 
         direction_emoji = "📈" if daily_pct > 0 else "📉"
 
+        # 讀取 USDC 流通量
+        state = load_state()
+        usdc_supply = state.get('usdc_supply', 0)
+        usdc_str = f"${usdc_supply/1e9:.1f}B ✅" if usdc_supply > 0 else "數據載入中..."
+
+        # 讀取 ARK 持倉
+        ark_shares = state.get('ark_total_shares', 0)
+        ark_str = f"{ark_shares/1e6:.2f}M 股 ✅" if ark_shares > 0 else "數據載入中..."
+
         msg = (
             f"📊 *CRCL 每日市場總結*\n"
             f"{'─' * 30}\n\n"
@@ -532,7 +1018,8 @@ def send_daily_summary():
             f"價格位置：{price_status}\n\n"
             f"{'─' * 30}\n"
             f"*持有理由檢查：*\n"
-            f"✅ USDC 業務：繼續運營中\n"
+            f"✅ USDC 流通量：{usdc_str}\n"
+            f"✅ ARK 持倉：{ark_str}\n"
             f"✅ Visa 合作：維持中\n"
             f"✅ 法案進展：正常推進中\n\n"
             f"{'─' * 30}\n"
@@ -553,7 +1040,7 @@ def send_daily_summary():
 def run_all_checks():
     """執行所有監控模組"""
     print(f"\n{'='*50}")
-    print(f"CRCL 監控系統啟動 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"CRCL 監控系統 v2.0 啟動 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*50}\n")
 
     # 獲取價格數據
@@ -576,7 +1063,19 @@ def run_all_checks():
     # 模組四：重要新聞過濾
     check_news()
 
-    print(f"\n✅ 本次檢查完成")
+    # 模組六：ARK 持倉監控（新）
+    check_ark_holdings()
+
+    # 模組七：期權市場情緒（新）
+    check_options_sentiment()
+
+    # 模組八：Clarity Act 法案進度（新）
+    check_clarity_act()
+
+    # 模組九：USDC 流通量（新）
+    check_usdc_supply()
+
+    print(f"\n✅ 本次檢查完成（v2.0）")
 
 def run_daily_summary():
     """執行每日總結（收盤後調用）"""
