@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-CRCL 完整免費版監控警報系統 v2.0
+CRCL 完整免費版監控警報系統 v3.0
 監控範圍：技術指標、大額成交量、SEC Form 4 高管交易、機構持倉變化、新聞過濾、每日總結
-新增：ARK 每日持倉監控、期權市場情緒、Clarity Act 法案進度追蹤、USDC 流通量監控
+v2.0 新增：ARK 每日持倉監控、期權市場情緒、Clarity Act 法案進度追蹤、USDC 流通量監控
+v3.0 新增：大升前兆綜合評分、持倉追蹤日報、每日收盤總結升級
 """
 
 import os
@@ -38,6 +39,17 @@ STOP_LOSS = 107.0
 # 防 FOMO 閾值
 FOMO_UP_PCT = 8.0
 FOMO_DOWN_PCT = -8.0
+
+# 持倉追蹤（你的買入記錄）
+POSITION_BATCHES = [
+    {"batch": 1, "cost": 121.43, "amount_usd": 30000},  # 第一批：$30,000 @ $121.43
+    # 第二批和第三批買入後在這裡加入
+    # {"batch": 2, "cost": 118.00, "amount_usd": 35000},
+    # {"batch": 3, "cost": 112.00, "amount_usd": 35000},
+]
+
+# 大升前兆評分閾值（達到此分數才發警報）
+BULLISH_SCORE_THRESHOLD = 3  # 滿分 5 分，達到 3 分以上才發警報
 
 # 大額成交量倍數（超過 5 日平均的 X 倍才算大額）
 VOLUME_SPIKE_MULTIPLIER = 3.0
@@ -970,6 +982,196 @@ def check_usdc_supply_fallback(state, last_supply):
         print(f"[USDC 備用] 錯誤: {e}")
 
 # ============================================================
+# 模組十（新）：大升前兆綜合評分
+# 綜合 RSI、成交量、期權情緒、ARK、法案 5 個維度評分
+# ============================================================
+
+def check_bullish_score(hist, current_price, current_rsi, current_vol, avg_vol):
+    """大升前兆綜合評分（滿分 5 分）"""
+    print("[大升前兆] 正在計算綜合評分...")
+    score = 0
+    score_details = []
+    state = load_state()
+    last_score_date = state.get('last_bullish_score_date', '')
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    # 分數一：RSI 超賣後反彈（1 分）
+    try:
+        if len(hist) >= 3:
+            rsi_today = hist['RSI'].iloc[-1]
+            rsi_yesterday = hist['RSI'].iloc[-2]
+            if rsi_yesterday < 35 and rsi_today > rsi_yesterday:
+                score += 1
+                score_details.append("✅ RSI 從超賣區反彈（{:.1f} → {:.1f}）".format(rsi_yesterday, rsi_today))
+            elif rsi_today < 40:
+                score += 0.5
+                score_details.append("🟡 RSI 尚在低位（{:.1f}），有反彈潛力".format(rsi_today))
+    except Exception as e:
+        print(f"[大升前兆] RSI 計算失敗: {e}")
+
+    # 分數二：成交量放大（1 分）
+    try:
+        if avg_vol > 0:
+            vol_ratio = current_vol / avg_vol
+            if vol_ratio >= 1.5:
+                score += 1
+                score_details.append("✅ 成交量放大 {:.1f} 倍，買盤承接中".format(vol_ratio))
+            elif vol_ratio >= 1.2:
+                score += 0.5
+                score_details.append("🟡 成交量小幅放大 {:.1f} 倍".format(vol_ratio))
+    except Exception as e:
+        print(f"[大升前兆] 成交量計算失敗: {e}")
+
+    # 分數三：期權市場看漲（1 分）
+    try:
+        ticker = yf.Ticker(TICKER)
+        expirations = ticker.options
+        if expirations:
+            chain = ticker.option_chain(expirations[0])
+            call_oi = chain.calls['openInterest'].sum()
+            put_oi = chain.puts['openInterest'].sum()
+            if call_oi > 0 and put_oi > 0:
+                pc_ratio = put_oi / call_oi
+                if pc_ratio < 0.7:
+                    score += 1
+                    score_details.append("✅ 期權市場強烈看漲（P/C 比率 {:.2f}）".format(pc_ratio))
+                elif pc_ratio < 0.9:
+                    score += 0.5
+                    score_details.append("🟡 期權市場偏向看漲（P/C 比率 {:.2f}）".format(pc_ratio))
+    except Exception as e:
+        print(f"[大升前兆] 期權計算失敗: {e}")
+
+    # 分數四：ARK 最近在買入（1 分）
+    try:
+        ark_last_update = state.get('ark_last_update', '')
+        ark_shares_now = state.get('ark_total_shares', 0)
+        # 如果 ARK 最近兩天有買入記錄
+        if ark_last_update and ark_shares_now > 0:
+            # 简化判斷：如果有 ARK 數據且持倉大於 400 萬股，計 0.5 分
+            if ark_shares_now > 4000000:
+                score += 0.5
+                score_details.append("🟡 ARK 持倉 {:,.0f} 股，機構信心充足".format(ark_shares_now))
+    except Exception as e:
+        print(f"[大升前兆] ARK 檢查失敗: {e}")
+
+    # 分數五：股價在支撑位反彈（1 分）
+    try:
+        if len(hist) >= 3:
+            price_today = hist['Close'].iloc[-1]
+            price_yesterday = hist['Close'].iloc[-2]
+            price_2days_ago = hist['Close'].iloc[-3]
+            # 前天下跌但今天反彈
+            if price_yesterday < price_2days_ago and price_today > price_yesterday:
+                score += 1
+                score_details.append("✅ 股價從低位反彈（{:.2f} → {:.2f}）".format(price_yesterday, price_today))
+    except Exception as e:
+        print(f"[大升前兆] 價格計算失敗: {e}")
+
+    score = min(score, 5)  # 最高 5 分
+    print(f"[大升前兆] 綜合評分: {score:.1f}/5")
+
+    # 達到閾值才發通知，且不重複發送同天
+    if score >= BULLISH_SCORE_THRESHOLD and last_score_date != today:
+        score_bar = "⭐" * int(score) + "○" * (5 - int(score))
+        details_str = "\n".join(score_details) if score_details else "計算中..."
+
+        if score >= 4:
+            strength = "非常強烈"
+            action_msg = "如果你還有剩餘資金，現在是加倉的好機會。"
+        else:
+            strength = "中等強度"
+            action_msg = "信號屬於中等強度，可以注意從低位反彈的機會。"
+
+        msg = (
+            f"⚡ *CRCL 大升前兆警報*\n\n"
+            f"綜合評分：*{score:.1f}/5* {score_bar}\n"
+            f"強度：{strength}\n\n"
+            f"*觸發信號：*\n{details_str}\n\n"
+            f"*這個信號的意思：*\n"
+            f"多個技術和基本面指標同時出現看漲信號，說明 CRCL 很可能即將反彈上漲。\n\n"
+            f"*{action_msg}*\n\n"
+            f"_記住：這是參考信號，不是保證。按照你的計劃行動。_"
+        )
+        send_telegram(msg)
+
+        state['last_bullish_score_date'] = today
+        save_state(state)
+    elif score >= BULLISH_SCORE_THRESHOLD:
+        print(f"[大升前兆] 今日已發送過評分警報，跳過")
+
+
+# ============================================================
+# 模組十一（新）：持倉追蹤
+# 顯示你的買入成本、現在市値、盈號情況
+# ============================================================
+
+def check_position_tracker(current_price):
+    """追蹤持倉盈號情況，每日收盤後發送一次"""
+    if not POSITION_BATCHES:
+        return
+
+    state = load_state()
+    last_position_date = state.get('last_position_date', '')
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    # 每日只發送一次
+    if last_position_date == today:
+        return
+
+    total_cost = 0
+    total_shares = 0
+    batch_details = ""
+
+    for b in POSITION_BATCHES:
+        shares = b['amount_usd'] / b['cost']
+        current_value = shares * current_price
+        pnl = current_value - b['amount_usd']
+        pnl_pct = (pnl / b['amount_usd']) * 100
+        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+
+        total_cost += b['amount_usd']
+        total_shares += shares
+
+        batch_details += (
+            f"第{b['batch']}批：{shares:.0f} 股 @ ${b['cost']:.2f}\n"
+            f"  現在市値：${current_value:,.0f}\n"
+            f"  盈號：{pnl_emoji} ${pnl:+,.0f}（{pnl_pct:+.1f}%）\n\n"
+        )
+
+    # 總計
+    total_current_value = total_shares * current_price
+    total_pnl = total_current_value - total_cost
+    total_pnl_pct = (total_pnl / total_cost) * 100
+    avg_cost = total_cost / total_shares if total_shares > 0 else 0
+
+    # 目標進度
+    target_200_progress = ((current_price - avg_cost) / (200 - avg_cost)) * 100 if avg_cost > 0 else 0
+    target_200_progress = max(0, min(100, target_200_progress))
+    progress_bar = "█" * int(target_200_progress / 10) + "░" * (10 - int(target_200_progress / 10))
+
+    total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+
+    msg = (
+        f"💼 *CRCL 持倉狀況日報*\n\n"
+        f"{batch_details}"
+        f"{'─' * 25}\n"
+        f"總投入：${total_cost:,.0f}\n"
+        f"現在總市値：${total_current_value:,.0f}\n"
+        f"總盈號：{total_emoji} ${total_pnl:+,.0f}（{total_pnl_pct:+.1f}%）\n"
+        f"平均成本：${avg_cost:.2f}\n\n"
+        f"🎯 目標 $200 進度：\n"
+        f"[{progress_bar}] {target_200_progress:.0f}%\n\n"
+        f"目標 $200 還需漲 ${200 - current_price:.2f}（+{((200 - current_price) / current_price * 100):.1f}%）\n"
+        f"達到 $200 的結果：${200 * total_shares:,.0f}（+${200 * total_shares - total_cost:,.0f}）\n\n"
+        f"_沒有警報 = 不需要行動 = 安心去生活_"
+    )
+    send_telegram(msg)
+
+    state['last_position_date'] = today
+    save_state(state)
+
+
+# ============================================================
 # 模組五：每日總結（升級版）
 # ============================================================
 
@@ -1071,11 +1273,20 @@ def run_all_checks():
 
     # 模組八：Clarity Act 法案進度（新）
     check_clarity_act()
-
-    # 模組九：USDC 流通量（新）
+    # 模組九：USADC 流通量（新）
     check_usdc_supply()
 
-    print(f"\n✅ 本次檢查完成（v2.0）")
+    # 模組十：大升前兆綜合評分（新）
+    if result:
+        current_price, daily_pct, current_rsi, current_vol, avg_vol = result
+        check_bullish_score(hist, current_price, current_rsi, current_vol, avg_vol)
+
+    # 模組十一：持倉追蹤（新）
+    if result:
+        current_price = result[0]
+        check_position_tracker(current_price)
+
+    print(f"\n✅ 本次檢查完成（v3.0）")
 
 def run_daily_summary():
     """執行每日總結（收盤後調用）"""
