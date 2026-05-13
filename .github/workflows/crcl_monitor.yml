@@ -1,7 +1,10 @@
-name: CRCL Monitor
+name: CRCL 股票監控警報系統
 
 on:
   schedule:
+    # 美股開盤前預覽（美東 9:00 AM = UTC 13:00）
+    - cron: '0 13 * * 1-5'
+    # 美股開盤時間（美東 9:30 AM = UTC 13:30）每 30 分鐘執行一次
     - cron: '30 13 * * 1-5'
     - cron: '0 14 * * 1-5'
     - cron: '30 14 * * 1-5'
@@ -16,23 +19,47 @@ on:
     - cron: '0 19 * * 1-5'
     - cron: '30 19 * * 1-5'
     - cron: '0 20 * * 1-5'
+    # 美股收盤後每日總結（美東 4:15 PM = UTC 20:15）
     - cron: '15 20 * * 1-5'
-  workflow_dispatch:
+  workflow_dispatch:  # 允許手動觸發
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    
     steps:
-    - name: Checkout
+    - name: 下載程式碼
       uses: actions/checkout@v4
-    - name: Setup Python
+      
+    - name: 設定 Python 環境
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
-    - name: Install packages
-      run: pip install yfinance requests pandas beautifulsoup4
-    - name: Run monitor
+        
+    - name: 安裝依賴套件
+      run: |
+        pip install yfinance requests pandas beautifulsoup4 feedparser
+        
+    - name: 執行開盤前預覽（盤前）
+      if: github.event.schedule == '0 13 * * 1-5'
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: python crcl_alert_full.py
+      run: |
+        python crcl_alert_full.py preview
+        
+    - name: 執行監控檢查（盤中）
+      if: github.event.schedule != '15 20 * * 1-5' && github.event.schedule != '0 13 * * 1-5'
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        python crcl_alert_full.py
+        
+    - name: 執行每日總結（收盤後）
+      if: github.event.schedule == '15 20 * * 1-5'
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        python crcl_alert_full.py daily
