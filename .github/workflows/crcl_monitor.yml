@@ -4,6 +4,9 @@ on:
   schedule:
     # 每日早晨日報（香港時間 早上 8:30 = UTC 0:30，每天包括週末）
     - cron: '30 0 * * *'
+    # 重大新聞掃描（每 30 分鐘一次，全天候包括週末）
+    - cron: '0 * * * *'
+    - cron: '30 * * * *'
     # 美股開盤前預覽（美東 9:00 AM = UTC 13:00，週一至五）
     - cron: '0 13 * * 1-5'
     # 美股開盤時間（美東 9:30 AM = UTC 13:30）每 30 分鐘執行一次
@@ -49,6 +52,14 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
         python daily_report.py
+
+    - name: 重大新聞掃描（每 30 分鐘，全天候）
+      if: github.event.schedule == '0 * * * *' || github.event.schedule == '30 * * * *'
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        python news_alert.py
         
     - name: 執行 CRCL 開盤前預覽（盤前 9:00）
       if: github.event.schedule == '0 13 * * 1-5'
@@ -59,7 +70,7 @@ jobs:
         python crcl_alert_full.py preview
         
     - name: 執行 CRCL 監控檢查（盤中，有信號才通知）
-      if: github.event.schedule != '15 20 * * 1-5' && github.event.schedule != '0 13 * * 1-5' && github.event.schedule != '30 0 * * *'
+      if: github.event.schedule != '15 20 * * 1-5' && github.event.schedule != '0 13 * * 1-5' && github.event.schedule != '30 0 * * *' && github.event.schedule != '0 * * * *' && github.event.schedule != '30 * * * *'
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
